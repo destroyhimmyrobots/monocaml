@@ -20,9 +20,8 @@ type oscSelector = OSCSelector of string
 type oscValue = OSCBool of bool
               | OSCInt of int
               | OSCString of string
-              | OSCPair of oscValue * oscValue
-              | OSCTriple of oscValue * oscValue * oscValue
               | OSCSelectorValue of oscSelector
+              | OSCList of oscValue list
 type oscMessage = { selector : oscSelector
                   ; parameters : oscValue list }
 (* type 'a oscValue' = OSCValue' of 'a
@@ -52,9 +51,8 @@ end = struct
     | OSCBool b -> if b then "1" else "0"
     | OSCInt i -> string_of_int i
     | OSCString s -> s
-    | OSCPair (a, w) -> concat_osc_list [a; w]
-    | OSCTriple (a, w, v) -> concat_osc_list [a;  w;  v]
     | OSCSelectorValue (OSCSelector s) -> s
+    | OSCList l -> concat_osc_list l
   and concat_osc_list w = concat_osc (List.map string_of_osc w)
   let build {selector = s; parameters = p} = concat_osc_list (OSCSelectorValue s :: p)
 end
@@ -67,13 +65,13 @@ module OscMatcher : sig
 end = struct
   let matcher sel param_matchers =
     let rec aux values matchers = match values, matchers with
-    | v :: vs , m :: ms -> (try m v
-                            with Match_failure _ -> raise OSCMessageParseError) :: aux vs ms
-    | [], [] -> []
-    | _ -> raise OSCMessageParseError
-  in function { selector   = s'
-              ; parameters = p' } when sel = s' -> aux p' param_matchers
-            | _ -> raise OSCValueMarshallError
+      | v :: vs , m :: ms -> (try m v
+                              with Match_failure _ -> raise OSCMessageParseError) :: aux vs ms
+      | [], [] -> []
+      | _ -> raise OSCMessageParseError
+    in function { selector   = s'
+                ; parameters = p' } when sel = s' -> aux p' param_matchers
+              | _ -> raise OSCValueMarshallError
 
   (* TODO: int_list matcher *)
   let int sel message =
@@ -90,50 +88,58 @@ end = struct
     with exn -> raise exn
 end
 
-module SerialOscApi : sig
-
-  module Daemon : sig
-    val prefix : oscSelector
-    module Send : sig
+module type SerialOscApi = sig
+  module type DaemonApi = sig
+    module type DaemonSendApi = sig
       val list : string -> int -> oscMessage   (* List connected devices *)
       val notify : string -> int -> oscMessage (* Change listening address *)
     end
-    module Receive : sig
-      val device : oscMessage -> (string, string, int) (* Currently connected device *)
+    module type DaemonRecvApi = sig
+      val device : oscMessage -> string * string * int (* Currently connected device *)
       val add : oscMessage -> string    (* Device connected *)
       val remove : oscMessage -> string (* Device disconnected *)
     end
+
+    val prefix : oscSelector
+    module Send : DaemonSendApi
+    module Receive : DaemonRecvApi
   end
 
-  module Device : sig
-    module Sys : sig
-      val prefix : oscSelector
-      module Send : sig
+  module type DeviceApi = sig
+    module type DeviceSysApi = sig
+      module type DeviceSysSendApi = sig
         val port : int -> oscMessage      (* Set client listening port *)
         val host : string -> oscMessage   (* Set client listening post *)
         val prefix : string -> oscMessage (* Set device message filter *)
         val rotation : int -> oscMessage  (* Set device rotation 0 90 180 270 *)
       end
-      module Receving : sig
+      module type DeviceSysRecvApi = sig
         val host : oscMessage -> string        (* device listen host *)
         val id : oscMessage -> string          (* device id  *)
         val port : oscMessage -> int           (* device listen port *)
         val prefix : oscMessage -> oscSelector (* application prefix *)
         val rotation : oscMessage -> int       (* grid device rotation *)
-        val size : oscMessage -> int, int      (* grid device size *)
+        val size : oscMessage -> int * int     (* grid device size *)
       end
-    end
-    module Info : sig
+
       val prefix : oscSelector
-      module Send : sig
-        val info : () -> oscMessage (* Receive device info messages at this application *)
+      module Send : DeviceSysSendApi
+      module Receive : DeviceSysRecvApi
+    end
+
+    module type DeviceInfoApi = sig
+      module type DeviceInfoSendApi = sig
+        val info : unit -> oscMessage (* Receive device info messages at this application *)
         val info' : int -> oscMessage (* Receive device info messages at localhost:port *)
         val info'' : string -> int -> oscMessage (* Receive device info messages to host:port *)
       end
-    end
-    module Grid : sig
+
       val prefix : oscSelector
-      module Send : sig
+      module Send : DeviceInfoSendApi
+    end
+
+    module type DeviceGridApi = sig
+      module type DeviceGridSendApi = sig
         (* TODO: point should be a function of grid size *)
         val let_set : point -> bool -> oscMessage              (* Set x, y to state *)
         val let_all : bool -> oscMessage                       (* Set all  to state *)
@@ -152,54 +158,68 @@ module SerialOscApi : sig
         val led_level_col : col -> offset -> intensity list -> oscMessage
         val tilt_set : tilt_sensor -> bool -> oscMessage
       end
-      module Receive : sig
+      module type DeviceGridRecvApi = sig
         val key : oscMessage -> key_state
         val tilt : oscMessage -> tilt_sensor * (int * int * int)
       end
+
+      val prefix  : oscSelector
+      module Send : DeviceGridSendApi
+      module Receive : DeviceGridRecvApi
+    end
+
+    module Sys  : DeviceSysApi
+    module Info : DeviceInfoApi
+    module Grid : DeviceGridApi
   end
 
-end = struct
-  let with_prefix = function (OSCSelector a) -> fun w -> OSCSelector (a ^ w)
+  module Daemon : DaemonApi
+  module Device : DeviceApi
+end
 
+let with_prefix = function a -> fun w -> OSCSelector (a ^ w)
+
+module SerialOscClient : SerialOscApi = struct
   module Daemon = struct
     let prefix = with_prefix "/serialosc"
     module Send = struct
-      let list   host port = OSCMessage (prefix "/list"   , [OSCString host, OSCInt port])
-      let notify host port = OSCMessage (prefix "/notify" , [OSCString host, OSCInt port])
+      let list   host port = { selector   = prefix "/list"
+                             ; parameters = [OSCString host; OSCInt port] }
+      let notify host port = { selector   = prefix "/notify"
+                             ; parameters = [OSCString host; OSCInt port] }
     end
     module Receive = struct
       let add    = OscMatcher.str (prefix "/add")
       let remove = OscMatcher.str (prefix "/remove")
       let device = function
-        | { selector   = prefix "/device"
-          ; parameters = OSCMessage (_, OSCTriple (OSCString id,
-                                                  OSCString typ,
-                                                  OSCInt port)) } -> (id, typ, port)
+          { selector = s ; parameters = [ OSCString id
+                                        ; OSCString typ
+                                        ; OSCInt port] }
+             when s = prefix "/device" -> id, typ, port
         | _ -> raise OSCMessageParseError
     end
   end
 
-  module Device = struct
-    module Sys = struct
+  module Device  = struct
+    module Sys  = struct
       let prefix = with_prefix "/sys"
       module Send = struct
-        let port p   = OscBuilder.int (prefix "/port"  ) p
-        let host h   = OscBuilder.str (prefix "/host"  ) h
-        let prefix p = OscBuilder.str (prefix "/prefix") p
-        let rotation r = match r with
-          | 0 | 90 | 180 | 270 -> OscBuilder.int (prefix "/rotation") r
-          | _ -> raise OSCMessageInputError
+        let port   = OscBuilder.int (prefix "/port"  )
+        let host   = OscBuilder.str (prefix "/host"  )
+        let prefix = OscBuilder.str (prefix "/prefix")
+        let rotation r = match r with | 0 | 90 | 180 | 270 -> OscBuilder.int (prefix "/rotation")
+                                      | _ -> raise OSCMessageInputError
       end
       module Receive = struct
-        let host     = OscMatcher.int (prefix "/host"  )
-        let id       = OscMatcher.str (prefix "/id"    )
-        let port     = OscMatcher.int (prefix "/port"  )
-        let prefix   = OscMatcher.str (prefix "/prefix")
+        let host     = OscMatcher.int (prefix "/host"    )
+        let id       = OscMatcher.str (prefix "/id"      )
+        let port     = OscMatcher.int (prefix "/port"    )
+        let prefix   = OscMatcher.str (prefix "/prefix"  )
         let rotation = OscMatcher.int (prefix "/rotation")
-        let size     = function | { selector   = prefix "/size"
-                                  ; parameters = OSCMessage [ OSCInt w
-                                                            , OSCInt h] } -> w, h
-                                | _ -> raise OSCMessageParseError
+        let size     = function
+          | { selector = s ; parameters = OSCMessage [ OSCInt w , OSCInt h] }
+               when s = prefix "/size" -> w, h
+          | _ -> raise OSCMessageParseError
       end
     end
 
@@ -212,9 +232,9 @@ end = struct
       end
     end
 
-    module Grid : sig
+    module Grid = struct
       let prefix = with_prefix "/grid"
-      module Send : sig
+      module Send = struct
         let let_set { row = r ; col = c } state =
           OscBuilder.int_list (prefix "/led/set") [r; c; int_of_bool state]
         let let_all =
@@ -228,20 +248,22 @@ end = struct
         let tilt_set sensor state =
           OscBuilder.int_list (prefix "/tilt")
                               [(match sensor with
-                               | Roll  -> 0
-                               | Yaw   -> 1
-                               | Pitch -> 2); int_of_bool state]
+                                | Roll  -> 0
+                                | Yaw   -> 1
+                                | Pitch -> 2); int_of_bool state]
       end
-      module Receive : sig
-        let key = function { selector = prefix "/key"
-                           ; parameter = OSCMessage ( OSCInt r
-                                                    , OSCInt c
-                                                    , OSCInt s) } -> { row = r ; col = c ; state = 0 <> s }
-        let tilt = function { selector = prefix "/tilt"
-                            ; parameter = OSCMessage ( OSCInt n
-                                                     , OSCInt x
-                                                     , OSCInt y
-                                                     , OSCInt z) } -> n, (x, y, z)
+      module Receive = struct
+        let key = function
+          | { selector = s
+            ; parameter = OSCMessage ( OSCInt r , OSCInt c , OSCInt s) }
+               when s = prefix "/key" -> { row = r ; col = c ; state = 0 <> s }
+          | _ -> raise OSCMessageParseError
+        let tilt = function
+            { selector = s
+            ; parameter = OSCMessage ( OSCInt n , OSCInt x , OSCInt y , OSCInt z) }
+               when s = prefix "/tilt" -> n, (x, y, z)
+          | _ -> raise OSCMessageParseError
       end
+    end
   end
 end
