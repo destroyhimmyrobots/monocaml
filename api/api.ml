@@ -4,33 +4,64 @@ exception OSCMessageParseError
 exception OSCMessageMatchError
 exception OSCValueMarshallError
 
-type intensity = Brightness of char (* LED brightness: 0x00 to 0x0F or '\000' to '\016' *)
+type grid_edition = Grid40h        (* 2006-2007 Tiltmod Binary *)
+                  | Grid40hSE      (* 2007	Tilt	Binary *)
+                  | Grid40hKit     (* 2007-2010 	Binary *)
+                  | GridSeries064  (* 2007-2010 Tilt	Binary *)
+                  | GridSeries128  (* 2007-2010 No	Binary *)
+                  | GridSeries256  (* 2007-2010 No	Binary *)
+                  | GridMK8x8      (* 2010 *)
+                  | GridMK8x16     (* 2010 *)
+                  | GridMK16x16    (* 2010 *)
+                  | GridGrey064    (* 2010-2012 Tilt	Binary	*)
+                  | GridGrey128    (* 2010-2012	Tilt	Binary	*)
+                  | Grid064        (* 2011-2012 Tilt	Quaternary-11/Sedenary-12 *)
+                  | Grid128        (* 2011-2015 Tilt-12	Quaternary-11/Sedenary-12 *)
+                  | Grid256        (* 2011-2012 Tilt	Quaternary-11/Sedenary-12 *)
+                  | Grid512        (* 2010 *)
+type grid_size = Grid064
+               | Grid128
+               | Grid256
+               | Grid512
+type grid_leds = Binary
+               | Quaternary
+               | Sedenary
+type grid_tilt = Nulliary       (* 2007-2010, 2013-2015 *)
+               | Uniaxis        (* 2006-2011 *)
+               | Triaxis        (* 2012 only *)
+type intensity = char (* LED brightness: 0x00 to 0x0F or '\000' to '\016' *)
+type grid_state = intensity array array
+type grid = { size  : grid_size
+            ; leds  : grid_leds
+            ; tilt  : grid_tilt
+            ; state : grid_state }
 type mask = char                    (* LED configuration: 8 bits. 0x00 to 0xFF or '\000' to '\255'. *)
-type row = char                     (* 0x00 to 0x0F or '\000' to '\016' *)
-type col = char                     (* 0x00 to 0x0F or '\000' to '\016' *)
+type row  = char                    (* 0x00 to 0x0F or '\000' to '\016' *)
+type col  = char                    (* 0x00 to 0x0F or '\000' to '\016' *)
 type point = { row : row ; col : col }
 type key_state = { key : point ; state : bool }
 type offset   = Noll | Atta
 type quadrant = I | II | III | IV
-type tiltValue = Roll of int | Yaw of int | Pitch of int (* 8-bit integers *)
+type tiltValue = Roll of int
+               | Yaw of int
+               | Pitch of int (* 8-bit integers *)
 type tiltSensor = Sensor of int
-type 'a array8  = 'a array
-type 'a array16 = 'a array
-type 'a array64 = 'a array
 type oscSelector = OSCSelector of string
 type oscValue = OSCBool of bool
               | OSCInt of int
+              | OSCInt8 of char
               | OSCString of string
               | OSCSelectorValue of oscSelector
               | OSCList of oscValue list
 type oscMessage = { selector : oscSelector
                   ; parameters : oscValue list }
-(* type 'a oscValue' = OSCValue' of 'a
-                     | OSCPair' of oscValue' * oscValue'
-                     | OSCTriple' of oscValue' * oscValue' *)
+
+let empty_osc_message = { selector = OSCSelector ""
+                        ; parameters = [] }
 
 let with_suffix = function a -> fun w -> OSCSelector (a ^ w)
-let int_of_bool = function true -> 1 | false -> 0
+let int_of_bool  = function true -> 1 | false -> 0
+let char_of_bool = function true -> '\001' | false -> '\000'
 let string_of_offset = function Noll -> "0"
                               | Atta -> "8"
 let string_of_quad = function I   -> "0 8"
@@ -47,21 +78,97 @@ let state_list_to_bit_vector states =
     | _ -> invalid_arg (string_of_int s)
   in List.mapi summands states |> sum_list
 
-(* DRY Module for building simple OSC Messages *)
+let intensity_of_int { leds = d } i : intensity =
+  match d with Sedenary -> Char.chr (max (min i 16) 0)
+             | Binary   -> Char.chr (16 * int_of_bool (i <> 0))
+             | Quaternary -> match i with
+                           | i' when i' < 1  -> '\000'
+                           | i' when i' < 5  -> '\001'
+                           | i' when i' < 9  -> '\003'
+                           | _ -> '\004'
+
+module GridParameterVerifier = struct
+  let row_mask_len = function Grid064 -> 1 | Grid128 -> 2 | Grid256 -> 2 | Grid512 -> 4
+  let col_mask_len = function Grid064 -> 1 | Grid128 -> 1 | Grid256 -> 2 | Grid512 -> 2
+
+  let row_len = function Grid064 -> 8 | Grid128 ->  8 | Grid256 -> 16 | Grid512 -> 16
+  let col_len = function Grid064 -> 8 | Grid128 -> 16 | Grid256 -> 16 | Grid512 -> 32
+
+  let mask { size = s } dimension masks = dimension s = Array.length masks
+
+  let intensities_range leds =
+    match leds with Binary     -> List.for_all (fun i -> i  = '\000' || i = '\001')
+                  | Quaternary -> List.for_all (fun i -> i >= '\000' && i < '\005')
+                  | Sedenary   -> List.for_all (fun i -> i >= '\000' && i < '\017')
+  let intensities grid { size = s ; leds = d } dimension (intensities : intensity list) =
+    intensities_range d intensities && dimension s = List.length intensities
+end
+
 module type OscMessageBuilder = sig
   val build : oscMessage -> string
   val bool : oscSelector -> bool -> oscMessage
+  val chr : oscSelector -> char -> oscMessage
   val int : oscSelector -> int -> oscMessage
   val str : oscSelector -> string -> oscMessage
+  val chr_list : oscSelector -> char list -> oscMessage
   val int_list : oscSelector -> int list -> oscMessage
   val str_list : oscSelector -> string list -> oscMessage
+end
+
+module OscBuilder : OscMessageBuilder = struct
+  let bool_list s bs = { selector = s; parameters = List.map (fun x -> OSCBool x  ) bs }
+  let  chr_list s cs = { selector = s; parameters = List.map (fun x -> OSCInt8 x  ) cs }
+  let  int_list s is = { selector = s; parameters = List.map (fun x -> OSCInt  x  ) is }
+  let  str_list s ss = { selector = s; parameters = List.map (fun t -> OSCString t) ss }
+  let bool s b = bool_list s [b]
+  let  chr s c =  chr_list s [c]
+  let  int s i =  int_list s [i]
+  let  str s t =  str_list s [t]
+
+  let concat_osc = String.concat " "
+  let rec string_of_osc = function
+    | OSCBool b -> if b then "1" else "0"
+    | OSCInt i -> string_of_int i
+    | OSCInt8 c -> Char.escaped c
+    | OSCString s -> s
+    | OSCSelectorValue (OSCSelector s) -> s
+    | OSCList l -> concat_osc_list l
+  and concat_osc_list w = concat_osc (List.map string_of_osc w)
+  let build {selector = s; parameters = p} = concat_osc_list (OSCSelectorValue s :: p)
 end
 
 (* DRY Module for building simple OSC Matchers *)
 module type OscMatcher = sig
   val matcher : oscSelector -> (oscValue -> oscValue) list -> (oscMessage -> oscValue list)
+  val chr : oscSelector -> oscMessage -> char
   val int : oscSelector -> oscMessage -> int
   val str : oscSelector -> oscMessage -> string
+end
+
+module OscMatcher : OscMatcher = struct
+  let matcher sel param_matchers =
+    let rec aux values matchers = match values, matchers with
+      | v :: vs , m :: ms -> (try m v
+                              with Match_failure _ -> raise OSCMessageParseError) :: aux vs ms
+      | [], [] -> []
+      | _ -> raise OSCMessageParseError
+    in function { selector   = s'
+                ; parameters = p' } when sel = s' -> aux p' param_matchers
+              | _ -> raise OSCValueMarshallError
+
+  (* TODO: int_list matcher *)
+  let int sel message =
+    match matcher sel [function OSCInt i -> OSCInt i] message
+    with | [OSCInt i] -> i
+         | _ -> raise OSCValueMarshallError
+  let chr sel message =
+    match matcher sel [function OSCInt8 c -> OSCInt8 c] message
+    with | [OSCInt8 c] -> c
+         | _ -> raise OSCValueMarshallError
+  let str sel message =
+    match matcher sel [function OSCString s -> OSCString s] message
+    with | [OSCString s] -> s
+         | _ -> raise OSCValueMarshallError
 end
 
 module type DaemonSendApi = sig
@@ -99,27 +206,27 @@ end
 
 module type DeviceGridSendApi = sig
   (* TODO: point should be a function of grid size *)
-  val led_set : key_state -> oscMessage              (* Set x, y to state *)
-  val led_all : bool -> oscMessage                       (* Set all  to state *)
+  val led_set : grid -> key_state -> oscMessage              (* Set x, y to state *)
+  val led_all : grid -> bool -> oscMessage                       (* Set all  to state *)
   (* TODO: offset should be a function of grid size *)
-  val led_map : quadrant -> int list list -> oscMessage    (* Set rows of quad  *)
+  val led_map : grid -> quadrant -> int list list -> oscMessage    (* Set rows of quad  *)
   (* TODO: led_row & led_col: limit size of lists based on row, col *)
-  val led_row : offset -> row -> mask list -> oscMessage (* Set rows at offset to states *)
-  val led_col : col -> offset -> mask list -> oscMessage (* Set cols at offset to states *)
-  val led_intensity : intensity -> oscMessage            (* ??? *)
-  val led_level_set : point -> intensity -> oscMessage   (* Set x, y to intensity *)
-  val led_level_all : intensity -> oscMessage            (* Set all to intensity *)
+  val led_row : grid -> offset -> row -> mask array -> oscMessage (* Set rows at offset to states *)
+  val led_col : grid -> col -> offset -> mask array -> oscMessage (* Set cols at offset to states *)
+  val led_intensity : grid -> intensity -> oscMessage            (* ??? *)
+  val led_level_set : grid -> point -> intensity array -> oscMessage   (* Set x, y to intensity *)
+  val led_level_all : grid -> intensity -> oscMessage            (* Set all to intensity *)
   (* NB. array64 used because the intensities are 4-bit values, unlike led_map *)
-  val led_level_map : quadrant -> intensity array64 -> oscMessage
+  val led_level_map : grid -> quadrant -> intensity array -> oscMessage
   (* TODO: led_level_row & led_level_col: limit size of lists based on row, col *)
-  val led_level_row : offset -> row -> intensity list -> oscMessage
-  val led_level_col : col -> offset -> intensity list -> oscMessage
-  val tilt_set : tiltSensor -> bool -> oscMessage
+  val led_level_row : grid -> offset -> row -> intensity list -> oscMessage
+  val led_level_col : grid -> col -> offset -> intensity list -> oscMessage
+  val tilt_set : grid -> tiltSensor -> bool -> oscMessage
 end
 
 module type DeviceGridRecvApi = sig
-  val key : oscMessage -> key_state
-  val tilt : oscMessage -> tiltSensor * (tiltValue * tiltValue * tiltValue)
+  val key  : grid -> oscMessage -> key_state
+  val tilt : grid -> oscMessage -> tiltSensor * (tiltValue * tiltValue * tiltValue)
 end
 
 module type DeviceSysApi = sig
@@ -155,47 +262,6 @@ end
 module type SerialOscApi = sig
   module Daemon : DaemonApi
   module Device : DeviceApi
-end
-
-module OscBuilder : OscMessageBuilder = struct
-  let bool_list s bs = { selector = s; parameters = List.map (fun x -> OSCBool x  ) bs }
-  let  int_list s is = { selector = s; parameters = List.map (fun x -> OSCInt x   ) is }
-  let  str_list s ss = { selector = s; parameters = List.map (fun t -> OSCString t) ss }
-  let bool s b = bool_list s [b]
-  let  int s i =  int_list s [i]
-  let  str s t =  str_list s [t]
-
-  let concat_osc = String.concat " "
-  let rec string_of_osc = function
-    | OSCBool b -> if b then "1" else "0"
-    | OSCInt i -> string_of_int i
-    | OSCString s -> s
-    | OSCSelectorValue (OSCSelector s) -> s
-    | OSCList l -> concat_osc_list l
-  and concat_osc_list w = concat_osc (List.map string_of_osc w)
-  let build {selector = s; parameters = p} = concat_osc_list (OSCSelectorValue s :: p)
-end
-
-module OscMatcher : OscMatcher = struct
-  let matcher sel param_matchers =
-    let rec aux values matchers = match values, matchers with
-      | v :: vs , m :: ms -> (try m v
-                              with Match_failure _ -> raise OSCMessageParseError) :: aux vs ms
-      | [], [] -> []
-      | _ -> raise OSCMessageParseError
-    in function { selector   = s'
-                ; parameters = p' } when sel = s' -> aux p' param_matchers
-              | _ -> raise OSCValueMarshallError
-
-  (* TODO: int_list matcher *)
-  let int sel message =
-    match matcher sel [function OSCInt i -> OSCInt i] message
-    with | [OSCInt i] -> i
-         | _ -> raise OSCValueMarshallError
-  let str sel message =
-    match matcher sel [function OSCString s -> OSCString s] message
-    with | [OSCString s] -> s
-         | _ -> raise OSCValueMarshallError
 end
 
 module SerialOscClient : SerialOscApi = struct
@@ -255,29 +321,56 @@ module SerialOscClient : SerialOscApi = struct
     module Grid = struct
       let suffix = with_suffix "/grid"
       module Send = struct
-        let led_set { key = { row = r ; col = c } ; state = s } =
-          OscBuilder.int_list (suffix "/led/set") [Char.code r; Char.code c; int_of_bool s]
-        let led_all =
+        let led_set _ { key = { row = r ; col = c } ; state = s } =
+          OscBuilder.chr_list (suffix "/led/set") [r; c; char_of_bool s]
+        let led_all _ =
           OscBuilder.bool (suffix "/led/all")
-        let led_intensity (Brightness b) =
-          OscBuilder.int (suffix "/led/intensity") (Char.code b)
-        let led_level_set { row = r ; col = c } (Brightness b) =
-          OscBuilder.int_list (suffix "/led/level/set") (List.map Char.code [r; c; b])
-        let led_level_all (Brightness b) =
-          OscBuilder.int (suffix "/led/level/all") (Char.code b)
-        let tilt_set sensor state =
+        let led_intensity _ b =
+          OscBuilder.chr (suffix "/led/intensity") b
+        let led_level_set _ { row = r ; col = c } b =
+          OscBuilder.chr_list (suffix "/led/level/set") [r; c; b]
+        let led_level_all _ b =
+          OscBuilder.int (suffix "/led/level/all") b
+        let tilt_set _ sensor state =
           OscBuilder.int_list (suffix "/tilt") [(function Sensor s -> s) sensor; int_of_bool state]
-        let led_map quad row_states =
+        let led_map _ quad row_states =
           if 8 <> List.length row_states then
             invalid_arg "Input must specify eight rows of states."
           else                  (* TODO: Guarantee that each row has 8 states, using a custom type. *)
             let states =  List.map (function r -> state_list_to_bit_vector r |> string_of_int) row_states
             in OscBuilder.str (suffix "/led/map") (String.concat " " (string_of_quad quad :: states))
-        let led_row offset row masks = OscBuilder.str (suffix "/led/row") "0 0 0"
-        let led_col col offset masks = OscBuilder.str (suffix "/led/col") "0 0 0"
-        let led_level_map quad intensities = OscBuilder.str (suffix "/led/level/map") "0 0 0"
-        let led_level_row offset row intensities = OscBuilder.str (suffix "/led/level/row") "0 0 0"
-        let led_level_col col offset intensities = OscBuilder.str (suffix "/lef/level/col") "0 0 0"
+        (* TODO: Use a custom type for masks rather than exceptions. *)
+        let led_row g offset row masks =
+          let open GridParameterVerifier in
+          if mask g col_mask_len masks then
+            OscBuilder.str (suffix "/led/row")
+                           (OSCInt8 offset :: List.map (fun m -> OSCInt8 m) masks)
+          else
+            invalid_arg "Masks must match row length."
+                        (* TODO: Use a custom type for masks rather than exceptions. *)
+        let led_col g col offset masks =
+          let open GridParameterVerifier in
+          if mask g col_mask_len masks then
+            OscBuilder.str (suffix "/led/col")
+                           (OSCInt8 offset :: List.map (fun m -> OSCInt8 m) masks)
+          else
+            invalid_arg "Masks must match column length."
+        let led_level_map g quad intensities =
+          OscBuilder.str (suffix "/led/level/map") "0 0 0"
+        let led_level_row g offset row intensities =
+          let open GridParameterVerifier in
+          if intensities g row_len intensities then
+            OscBuilder.str (suffix "/led/level/row")
+                           (OSCInt offset :: List.map (fun m -> OSCInt8 m) intensities)
+          else
+            invalid_arg "Intensities must match row length."
+        let led_level_col g col offset intensities =
+          let open GridParameterVerifier in
+          if intensities g col_len intensities then
+            OscBuilder.str (suffix "/lef/level/col")
+                           (OSCInt offset :: List.map (fun m -> OSCInt8 m) intensities)
+          else
+            invalid_arg "Intensities must match row length."
       end
       module Receive = struct
         let key = function
@@ -287,9 +380,9 @@ module SerialOscClient : SerialOscApi = struct
                                          ; state = 0 <> t }
           | _ -> raise OSCMessageParseError
         let tilt = function
-            { selector = s ; parameters = [OSCInt n; OSCInt x; OSCInt y; OSCInt z] }
+                     { selector = s ; parameters = [OSCInt n; OSCInt x; OSCInt y; OSCInt z] }
                when s = suffix "/tilt" -> Sensor n, (Roll x, Pitch y, Yaw z)
-          | _ -> raise OSCMessageParseError
+                 | _ -> raise OSCMessageParseError
       end
     end
   end
