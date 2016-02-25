@@ -1,0 +1,5 @@
+exception OSCMessageInputError
+exception OSCMessageParseError
+exception OSCMessageMatchError
+exception OSCValueMarshallError
+
