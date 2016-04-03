@@ -10,6 +10,7 @@ OSC_OBJ_FILES=$(OSC_DIR)/OscMatcher.cmo \
 COLLECTIONS_OBJ_FILES=$(COL_DIR)FixedSizeList.cmo
 MBASE_OBJ_FILES=$(MONOME_DIR)/exceptions.cmo \
 				$(MONOME_DIR)/types.cmo \
+				$(MONOME_DIR)/MonomeParameterVerifier.cmo \
 				$(MONOME_DIR)/utils.cmo 
 
 .PHONY: clean setup

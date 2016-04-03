@@ -1,4 +1,4 @@
-type grid_series = Grid40h        (* 200p6-2007 Tiltmod Binary *)
+type grid_series = Grid40h        (* 20p6-2007 Tiltmod Binary *)
                  | Grid40hSE      (* 2007	Tilt	Binary *)
                  | Grid40hKit     (* 2007-2010 	Binary *)
                  | GridSeries064  (* 2007-2010 Tilt	Binary *)
